@@ -1,17 +1,7 @@
-;; --- Constants & Errors ---
-(define-constant ERR-NO-FUNDS (err u100))
-(define-constant ERR-NO-SHARES (err u101))
-(define-constant ERR-PAUSED (err u102))
-(define-constant ERR-NOT-ADMIN (err u103))
-(define-constant ERR-INVALID-FEE (err u104))
-(define-constant ERR-NOT-WHITELISTED (err u105))
-(define-constant ERR-NOT-EMERGENCY (err u106))
-(define-constant ERR-ASSET-NOT-SUPPORTED (err u107))
-(define-constant ERR-ASSET-DISABLED (err u108))
-(define-constant ERR-MAX-ALLOCATION-EXCEEDED (err u109))
-(define-constant ERR-INVALID-TOKEN (err u110))
+;; Multi-Asset Vault Contract with Security Enhancements
+;; A comprehensive vault system supporting multiple assets with tiered fee structure
 
-;; --- SIP-010 Trait Definition ---
+;; SIP-010 Trait Definition
 (define-trait sip-010-trait
   (
     (transfer (uint principal principal (optional (buff 34))) (response bool uint))
@@ -24,517 +14,691 @@
   )
 )
 
-;; --- Admin & Pause ---
+;; Error Constants
+(define-constant ERR_UNAUTHORIZED (err u100))
+(define-constant ERR_PAUSED (err u101))
+(define-constant ERR_NOT_WHITELISTED (err u102))
+(define-constant ERR_INSUFFICIENT_BALANCE (err u103))
+(define-constant ERR_INSUFFICIENT_SHARES (err u104))
+(define-constant ERR_INVALID_AMOUNT (err u105))
+(define-constant ERR_TRANSFER_FAILED (err u106))
+(define-constant ERR_ASSET_NOT_FOUND (err u107))
+(define-constant ERR_NOT_EMERGENCY (err u108))
+(define-constant ERR_INVALID_TOKEN (err u1001))
+(define-constant ERR_INVALID_RECIPIENT (err u1002))
+(define-constant ERR_SELF_TRANSFER (err u1003))
+(define-constant ERR_ASSET_EXISTS (err u1004))
+(define-constant ERR_ASSET_DISABLED (err u1005))
+(define-constant ERR_SLIPPAGE_EXCEEDED (err u1006))
+(define-constant ERR_VAULT_INVARIANT (err u1007))
+
+;; Contract Variables
 (define-data-var admin principal tx-sender)
 (define-data-var paused bool false)
 (define-data-var emergency-mode bool false)
-
-;; --- Vault State ---
 (define-data-var total-shares uint u0)
 (define-data-var total-assets uint u0)
-(define-data-var strategy uint u0) ;; 0 = idle, 1 = basic yield, etc.
+(define-data-var base-withdraw-fee-bps uint u50) ;; 0.5%
+(define-data-var performance-fee-bps uint u200) ;; 2%
+(define-data-var fee-recipient principal tx-sender)
+(define-data-var staked-amount uint u0)
 
-;; --- Multi-Asset Support ---
+;; Data Maps
+(define-map user-shares 
+  {user: principal} 
+  {
+    shares: uint,
+    total-volume: uint,
+    last-deposit: uint
+  }
+)
+
+(define-map whitelist 
+  {user: principal} 
+  {whitelisted: bool}
+)
+
 (define-map asset-configs 
   {token: principal} 
   {
     enabled: bool,
-    max-allocation: uint, ;; in basis points (10000 = 100%)
+    max-allocation: uint,
     current-allocation: uint,
     decimals: uint
   }
 )
 
-(define-map asset-balances 
-  {token: principal} 
+(define-map asset-balances
+  {token: principal}
+  {balance: uint}
+)
+
+;; User Tier Configuration
+(define-map user-tiers
   uint
-)
-
-;; --- User Data ---
-(define-map shares {user: principal} uint)
-(define-map user-tiers 
-  {user: principal} 
   {
-    tier: uint, ;; 0=basic, 1=silver, 2=gold, 3=platinum
-    total-volume: uint,
-    last-deposit-height: uint
-  }
-)
-
-;; --- Legacy Support ---
-(define-data-var staked-amount uint u0)
-(define-data-var fake-yield uint u0) ;; simulate returns
-
-;; --- Dynamic Fee Structure ---
-(define-data-var base-withdraw-fee-bps uint u50) ;; 0.5% default (basis points: 1/10000)
-(define-data-var performance-fee-bps uint u200) ;; 2% performance fee
-(define-data-var fee-recipient principal tx-sender)
-
-;; Tier-based fee discounts (in basis points reduction)
-(define-map tier-discounts 
-  {tier: uint} 
-  {
+    min-volume: uint,
     withdraw-discount: uint,
-    performance-discount: uint,
-    volume-threshold: uint ;; STX volume needed for tier
+    performance-discount: uint
   }
 )
 
-;; --- Whitelist ---
-(define-map whitelist {user: principal} bool)
+;; Default Values
+(define-constant DEFAULT_USER_DATA {shares: u0, total-volume: u0, last-deposit: u0})
 
-;; --- Helper Functions ---
-(define-private (only-admin)
-  (begin
-    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-ADMIN)
-    (ok true)
+;; Input validation functions
+(define-private (is-valid-amount (amount uint))
+  (and (> amount u0) (<= amount u340282366920938463463374607431768211455))) ;; Max uint value
+
+(define-private (is-valid-principal (addr principal))
+  (not (is-eq addr 'SP000000000000000000002Q6VF78)))
+
+(define-private (is-valid-token-contract (token <sip-010-trait>))
+  (let ((token-principal (contract-of token)))
+    (and 
+      (is-valid-principal token-principal)
+      (not (is-eq token-principal (as-contract tx-sender))))))
+
+(define-private (validate-shares-amount (shares uint))
+  (and 
+    (> shares u0)
+    (<= shares u340282366920938463463374607431768211455)))
+
+(define-private (is-valid-fee-bps (fee-bps uint))
+  (and (>= fee-bps u0) (<= fee-bps u10000))) ;; 0-100%
+
+;; IMPROVEMENT 1: Division by Zero Protection and Vault Invariants
+(define-private (check-vault-invariants)
+  (let (
+    (total-shares-val (var-get total-shares))
+    (total-assets-val (var-get total-assets))
   )
-)
+    ;; Ensure mathematical consistency
+    (and 
+      (or (is-eq total-shares-val u0) (> total-assets-val u0))
+      (or (is-eq total-assets-val u0) (> total-shares-val u0))
+      ;; Additional invariant: if shares exist, assets must exist
+      (or (is-eq total-shares-val u0) (> total-assets-val u0)))))
 
-(define-private (when-not-paused)
-  (begin
-    (asserts! (not (var-get paused)) ERR-PAUSED)
-    (ok true)
-  )
-)
-
-(define-private (only-whitelisted)
-  (begin
-    (asserts! (default-to false (map-get? whitelist {user: tx-sender})) ERR-NOT-WHITELISTED)
-    (ok true)
-  )
-)
-
-(define-private (is-asset-supported (token principal))
-  (let ((config (map-get? asset-configs {token: token})))
-    (and (is-some config) (get enabled (unwrap-panic config)))
-  )
-)
-
-;; --- Initialize Default Assets ---
-(define-private (init-default-assets)
-  (begin
-    ;; Add STX as default asset (using tx-sender as placeholder for STX)
-    (map-set asset-configs 
-      {token: tx-sender} 
-      {enabled: true, max-allocation: u10000, current-allocation: u0, decimals: u6})
-    
-    ;; Initialize tier discounts
-    (map-set tier-discounts {tier: u0} {withdraw-discount: u0, performance-discount: u0, volume-threshold: u0})
-    (map-set tier-discounts {tier: u1} {withdraw-discount: u10, performance-discount: u25, volume-threshold: u100000000}) ;; 100 STX
-    (map-set tier-discounts {tier: u2} {withdraw-discount: u25, performance-discount: u50, volume-threshold: u500000000}) ;; 500 STX
-    (map-set tier-discounts {tier: u3} {withdraw-discount: u50, performance-discount: u100, volume-threshold: u1000000000}) ;; 1000 STX
-    
-    (ok true)
-  )
-)
-
-;; Initialize on deployment
-(init-default-assets)
-
-;; --- Multi-Asset Management ---
-(define-public (add-supported-asset (token <sip-010-trait>) (max-allocation uint) (decimals uint))
-  (begin
-    (try! (only-admin))
-    (asserts! (<= max-allocation u10000) ERR-INVALID-FEE) ;; max 100%
-    (map-set asset-configs 
-      {token: (contract-of token)} 
-      {enabled: true, max-allocation: max-allocation, current-allocation: u0, decimals: decimals})
-    (print {event: "asset-added", token: (contract-of token), max-allocation: max-allocation})
-    (ok true)
-  )
-)
-
-(define-public (toggle-asset (token principal) (enabled bool))
-  (begin
-    (try! (only-admin))
-    (let ((config (unwrap! (map-get? asset-configs {token: token}) ERR-ASSET-NOT-SUPPORTED)))
-      (map-set asset-configs 
-        {token: token} 
-        (merge config {enabled: enabled}))
-      (print {event: "asset-toggled", token: token, enabled: enabled})
-      (ok true)
-    )
-  )
-)
-
-;; --- Dynamic Fee Calculation ---
+;; Helper Functions with Division by Zero Protection
 (define-private (calculate-user-tier (user principal))
-  (let ((user-data (default-to {tier: u0, total-volume: u0, last-deposit-height: u0} 
-                               (map-get? user-tiers {user: user}))))
+  (let ((user-data (default-to DEFAULT_USER_DATA (map-get? user-shares {user: user}))))
     (let ((volume (get total-volume user-data)))
       (if (>= volume u1000000000) u3 ;; Platinum: 1000+ STX
         (if (>= volume u500000000) u2 ;; Gold: 500+ STX
           (if (>= volume u100000000) u1 ;; Silver: 100+ STX
-            u0))) ;; Basic: < 100 STX
-    )
-  )
-)
+            u0)))))) ;; Basic: < 100 STX
 
 (define-private (get-user-withdraw-fee (user principal) (amount uint))
   (let (
+    (tier (calculate-user-tier user))
+    (tier-info (default-to {min-volume: u0, withdraw-discount: u0, performance-discount: u0} (map-get? user-tiers tier)))
     (base-fee (var-get base-withdraw-fee-bps))
-    (user-tier (calculate-user-tier user))
-    (tier-info (default-to {withdraw-discount: u0, performance-discount: u0, volume-threshold: u0} 
-                           (map-get? tier-discounts {tier: user-tier})))
     (discount (get withdraw-discount tier-info))
     (discounted-fee (if (>= base-fee discount) (- base-fee discount) u0))
   )
-    (/ (* amount discounted-fee) u10000)
-  )
-)
+    (/ (* amount discounted-fee) u10000)))
 
-(define-private (update-user-tier (user principal) (volume-to-add uint))
+(define-private (get-user-performance-fee (user principal) (amount uint))
   (let (
-    (current-data (default-to {tier: u0, total-volume: u0, last-deposit-height: stacks-block-height} 
-                             (map-get? user-tiers {user: user})))
-    (new-volume (+ (get total-volume current-data) volume-to-add))
-    (new-tier (calculate-user-tier user))
+    (tier (calculate-user-tier user))
+    (tier-info (default-to {min-volume: u0, withdraw-discount: u0, performance-discount: u0} (map-get? user-tiers tier)))
+    (base-fee (var-get performance-fee-bps))
+    (discount (get performance-discount tier-info))
+    (discounted-fee (if (>= base-fee discount) (- base-fee discount) u0))
   )
-    (map-set user-tiers 
-      {user: user} 
-      {tier: new-tier, total-volume: new-volume, last-deposit-height: stacks-block-height})
-    (ok new-tier)
-  )
-)
+    (/ (* amount discounted-fee) u10000)))
 
-;; --- Admin Functions ---
-(define-public (set-admin (new-admin principal))
+;; IMPROVED: Safe calculation functions with division by zero protection
+(define-private (calculate-shares (amount uint))
+  (let (
+    (current-total-shares (var-get total-shares))
+    (current-total-assets (var-get total-assets))
+  )
+    (if (is-eq current-total-shares u0)
+      amount ;; First deposit: 1:1 ratio
+      (if (is-eq current-total-assets u0)
+        u0 ;; Prevent division by zero - should not happen in normal operation
+        (/ (* amount current-total-shares) current-total-assets)))))
+
+(define-private (calculate-assets (shares uint))
+  (let (
+    (current-total-shares (var-get total-shares))
+    (current-total-assets (var-get total-assets))
+  )
+    (if (or (is-eq current-total-shares u0) (is-eq shares u0))
+      u0
+      (/ (* shares current-total-assets) current-total-shares))))
+
+;; IMPROVEMENT 2: Preview Functions for Slippage Protection
+(define-read-only (preview-deposit (amount uint))
+  (calculate-shares amount))
+
+(define-read-only (preview-withdraw (shares uint))
+  (calculate-assets shares))
+
+(define-read-only (preview-withdraw-with-fee (user principal) (shares uint))
+  (let (
+    (assets-to-redeem (calculate-assets shares))
+    (withdraw-fee (get-user-withdraw-fee user assets-to-redeem))
+  )
+    {
+      gross-amount: assets-to-redeem,
+      fee: withdraw-fee,
+      net-amount: (if (>= assets-to-redeem withdraw-fee) (- assets-to-redeem withdraw-fee) u0)
+    }))
+
+;; Asset Management Functions
+(define-public (add-asset (token <sip-010-trait>) (decimals uint))
   (begin
-    (try! (only-admin))
-    (var-set admin new-admin)
-    (ok true)
-  )
-)
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    ;; Validate inputs
+    (asserts! (is-valid-token-contract token) ERR_INVALID_TOKEN)
+    (asserts! (and (>= decimals u0) (<= decimals u18)) ERR_INVALID_AMOUNT)
+    
+    (let ((token-principal (contract-of token)))
+      (asserts! (is-none (map-get? asset-configs {token: token-principal})) ERR_ASSET_EXISTS)
+      (map-set asset-configs 
+        {token: token-principal}
+        {
+          enabled: true,
+          max-allocation: u1000, ;; 10%
+          current-allocation: u0,
+          decimals: decimals
+        })
+      (map-set asset-balances {token: token-principal} {balance: u0})
+      (ok true))))
 
-(define-public (pause)
+(define-public (remove-asset (token <sip-010-trait>))
   (begin
-    (try! (only-admin))
-    (var-set paused true)
-    (print {event: "paused"})
-    (ok true)
-  )
-)
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    (asserts! (is-valid-token-contract token) ERR_INVALID_TOKEN)
+    
+    (let ((token-principal (contract-of token)))
+      (asserts! (is-some (map-get? asset-configs {token: token-principal})) ERR_ASSET_NOT_FOUND)
+      (map-delete asset-configs {token: token-principal})
+      (map-delete asset-balances {token: token-principal})
+      (ok true))))
 
-(define-public (unpause)
-  (begin
-    (try! (only-admin))
-    (var-set paused false)
-    (print {event: "unpaused"})
-    (ok true)
-  )
-)
-
-(define-public (set-base-withdraw-fee (fee-bps uint))
-  (begin
-    (try! (only-admin))
-    (asserts! (<= fee-bps u1000) ERR-INVALID-FEE) ;; max 10%
-    (var-set base-withdraw-fee-bps fee-bps)
-    (ok true)
-  )
-)
-
-(define-public (set-performance-fee (fee-bps uint))
-  (begin
-    (try! (only-admin))
-    (asserts! (<= fee-bps u2000) ERR-INVALID-FEE) ;; max 20%
-    (var-set performance-fee-bps fee-bps)
-    (ok true)
-  )
-)
-
-(define-public (set-fee-recipient (recipient principal))
-  (begin
-    (try! (only-admin))
-    (var-set fee-recipient recipient)
-    (ok true)
-  )
-)
-
-(define-public (update-tier-discount (tier uint) (withdraw-discount uint) (performance-discount uint) (volume-threshold uint))
-  (begin
-    (try! (only-admin))
-    (asserts! (<= tier u3) ERR-INVALID-FEE)
-    (asserts! (<= withdraw-discount u100) ERR-INVALID-FEE) ;; max 1% discount
-    (asserts! (<= performance-discount u200) ERR-INVALID-FEE) ;; max 2% discount
-    (map-set tier-discounts 
-      {tier: tier} 
-      {withdraw-discount: withdraw-discount, performance-discount: performance-discount, volume-threshold: volume-threshold})
-    (ok true)
-  )
-)
-
-(define-public (update-whitelist (user principal) (status bool))
-  (begin
-    (try! (only-admin))
-    (map-set whitelist {user: user} status)
-    (print {event: "whitelist-updated", user: user, status: status})
-    (ok true)
-  )
-)
-
-(define-public (enable-emergency)
-  (begin
-    (try! (only-admin))
-    (var-set emergency-mode true)
-    (print {event: "emergency-enabled"})
-    (ok true)
-  )
-)
-
-(define-public (disable-emergency)
-  (begin
-    (try! (only-admin))
-    (var-set emergency-mode false)
-    (print {event: "emergency-disabled"})
-    (ok true)
-  )
-)
-
-;; --- Upgradeability ---
-(define-public (upgrade (new-contract principal))
-  (begin
-    (try! (only-admin))
-    (print {event: "upgraded", new-contract: new-contract})
-    (ok true)
-  )
-)
-
-;; --- STX Deposit (Legacy Support) ---
+;; IMPROVED: Core Deposit Functions with Invariant Checks
 (define-public (deposit (amount uint))
   (begin
-    (try! (when-not-paused))
-    (try! (only-whitelisted))
-    (asserts! (> amount u0) ERR-NO-FUNDS)
+    (asserts! (not (var-get paused)) ERR_PAUSED)
+    (asserts! (is-some (map-get? whitelist {user: tx-sender})) ERR_NOT_WHITELISTED)
+    (asserts! (is-valid-amount amount) ERR_INVALID_AMOUNT)
+    (asserts! (check-vault-invariants) ERR_VAULT_INVARIANT) ;; Add invariant check
+    
     (let (
-          (assets (var-get total-assets))
-          (cur-total-shares (var-get total-shares))
-          (new-shares (if (is-eq assets u0)
-                            amount
-                            (/ (* amount cur-total-shares) assets)))
-      )
-      (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
-      (map-set shares {user: tx-sender} 
-               (+ (default-to u0 (map-get? shares {user: tx-sender})) new-shares))
-      (var-set total-assets (+ assets amount))
-      (var-set total-shares (+ cur-total-shares new-shares))
-      
-      ;; Update user tier
-      (unwrap-panic (update-user-tier tx-sender amount))
-      
-      (print {event: "deposit", user: tx-sender, amount: amount, shares: new-shares})
-      (ok new-shares)
+      (shares-to-mint (calculate-shares amount))
+      (user-data (default-to DEFAULT_USER_DATA (map-get? user-shares {user: tx-sender})))
+      (current-shares (get shares user-data))
+      (current-volume (get total-volume user-data))
     )
-  )
-)
+      ;; Transfer STX to contract
+      (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+      
+      ;; Update user data
+      (map-set user-shares 
+        {user: tx-sender}
+        {
+          shares: (+ current-shares shares-to-mint),
+          total-volume: (+ current-volume amount),
+          last-deposit: stacks-block-height
+        })
+      
+      ;; Update vault totals
+      (var-set total-shares (+ (var-get total-shares) shares-to-mint))
+      (var-set total-assets (+ (var-get total-assets) amount))
+      
+      (ok shares-to-mint))))
 
-;; --- Multi-Asset Deposit ---
+;; NEW: Enhanced deposit with slippage protection
+(define-public (deposit-with-slippage (amount uint) (min-shares uint))
+  (begin
+    (asserts! (not (var-get paused)) ERR_PAUSED)
+    (asserts! (is-some (map-get? whitelist {user: tx-sender})) ERR_NOT_WHITELISTED)
+    (asserts! (is-valid-amount amount) ERR_INVALID_AMOUNT)
+    (asserts! (> min-shares u0) ERR_INVALID_AMOUNT)
+    (asserts! (check-vault-invariants) ERR_VAULT_INVARIANT)
+    
+    (let (
+      (shares-to-mint (calculate-shares amount))
+      (user-data (default-to DEFAULT_USER_DATA (map-get? user-shares {user: tx-sender})))
+      (current-shares (get shares user-data))
+      (current-volume (get total-volume user-data))
+    )
+      ;; Slippage protection
+      (asserts! (>= shares-to-mint min-shares) ERR_SLIPPAGE_EXCEEDED)
+      
+      ;; Transfer STX to contract
+      (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+      
+      ;; Update user data
+      (map-set user-shares 
+        {user: tx-sender}
+        {
+          shares: (+ current-shares shares-to-mint),
+          total-volume: (+ current-volume amount),
+          last-deposit: stacks-block-height
+        })
+      
+      ;; Update vault totals
+      (var-set total-shares (+ (var-get total-shares) shares-to-mint))
+      (var-set total-assets (+ (var-get total-assets) amount))
+      
+      (ok shares-to-mint))))
+
+(define-private (deposit-token-internal (token <sip-010-trait>) (amount uint))
+  (let (
+    (shares-to-mint (calculate-shares amount))
+    (user-data (default-to DEFAULT_USER_DATA (map-get? user-shares {user: tx-sender})))
+    (current-shares (get shares user-data))
+    (current-volume (get total-volume user-data))
+    (token-principal (contract-of token))
+  )
+    ;; Transfer token to contract
+    (try! (contract-call? token transfer amount tx-sender (as-contract tx-sender) none))
+    
+    ;; Update asset balance
+    (let ((current-balance (default-to {balance: u0} (map-get? asset-balances {token: token-principal}))))
+      (map-set asset-balances 
+        {token: token-principal} 
+        {balance: (+ (get balance current-balance) amount)}))
+    
+    ;; Update user data
+    (map-set user-shares 
+      {user: tx-sender}
+      {
+        shares: (+ current-shares shares-to-mint),
+        total-volume: (+ current-volume amount),
+        last-deposit: stacks-block-height
+      })
+    
+    ;; Update vault totals
+    (var-set total-shares (+ (var-get total-shares) shares-to-mint))
+    (var-set total-assets (+ (var-get total-assets) amount))
+    
+    ;; Return the shares minted wrapped in ok
+    (ok shares-to-mint)))
+
 (define-public (deposit-token (token <sip-010-trait>) (amount uint))
   (begin
-    (try! (when-not-paused))
-    (try! (only-whitelisted))
-    (asserts! (> amount u0) ERR-NO-FUNDS)
-    (asserts! (is-asset-supported (contract-of token)) ERR-ASSET-NOT-SUPPORTED)
+    (asserts! (not (var-get paused)) ERR_PAUSED)
+    (asserts! (is-some (map-get? whitelist {user: tx-sender})) ERR_NOT_WHITELISTED)
+    ;; Validate inputs
+    (asserts! (is-valid-token-contract token) ERR_INVALID_TOKEN)
+    (asserts! (is-valid-amount amount) ERR_INVALID_AMOUNT)
+    (asserts! (check-vault-invariants) ERR_VAULT_INVARIANT) ;; Add invariant check
     
     (let (
       (token-principal (contract-of token))
-      (assets (var-get total-assets))
-      (cur-total-shares (var-get total-shares))
-      ;; Convert token amount to STX equivalent (simplified 1:1 for now)
-      (stx-equivalent amount)
-      (new-shares (if (is-eq assets u0)
-                        stx-equivalent
-                        (/ (* stx-equivalent cur-total-shares) assets)))
+      (asset-config (unwrap! (map-get? asset-configs {token: token-principal}) ERR_ASSET_NOT_FOUND))
     )
-      ;; Transfer tokens to contract
-      (try! (contract-call? token transfer amount tx-sender (as-contract tx-sender) none))
-      
-      ;; Update user shares
-      (map-set shares {user: tx-sender} 
-               (+ (default-to u0 (map-get? shares {user: tx-sender})) new-shares))
-      
-      ;; Update vault totals
-      (var-set total-assets (+ assets stx-equivalent))
-      (var-set total-shares (+ cur-total-shares new-shares))
-      
-      ;; Update asset balance
-      (map-set asset-balances 
-        {token: token-principal} 
-        (+ (default-to u0 (map-get? asset-balances {token: token-principal})) amount))
-      
-      ;; Update user tier
-      (unwrap-panic (update-user-tier tx-sender stx-equivalent))
-      
-      (print {event: "token-deposit", user: tx-sender, token: token-principal, amount: amount, shares: new-shares})
-      (ok new-shares)
-    )
-  )
-)
+      (asserts! (get enabled asset-config) ERR_ASSET_DISABLED)
+      ;; Call internal function which returns a response
+      (deposit-token-internal token amount))))
 
-;; --- STX Withdraw (with dynamic fees) ---
-(define-public (withdraw (user-shares uint))
+;; NEW: Enhanced token deposit with slippage protection
+(define-public (deposit-token-with-slippage (token <sip-010-trait>) (amount uint) (min-shares uint))
   (begin
-    (try! (when-not-paused))
-    (try! (only-whitelisted))
+    (asserts! (not (var-get paused)) ERR_PAUSED)
+    (asserts! (is-some (map-get? whitelist {user: tx-sender})) ERR_NOT_WHITELISTED)
+    (asserts! (is-valid-token-contract token) ERR_INVALID_TOKEN)
+    (asserts! (is-valid-amount amount) ERR_INVALID_AMOUNT)
+    (asserts! (> min-shares u0) ERR_INVALID_AMOUNT)
+    (asserts! (check-vault-invariants) ERR_VAULT_INVARIANT)
+    
     (let (
-          (user-balance (default-to u0 (map-get? shares {user: tx-sender})))
-          (vault-assets (var-get total-assets))
-          (vault-shares (var-get total-shares))
-      )
-      (asserts! (<= user-shares user-balance) ERR-NO-SHARES)
-      (let (
-        (redeem-amount (/ (* user-shares vault-assets) vault-shares))
-        (fee (get-user-withdraw-fee tx-sender redeem-amount))
-        (to-user (- redeem-amount fee))
-        (recipient (var-get fee-recipient))
-      )
-        (map-set shares {user: tx-sender} (- user-balance user-shares))
-        (var-set total-shares (- vault-shares user-shares))
-        (var-set total-assets (- vault-assets redeem-amount))
-        
-        ;; Handle fee transfer
-        (try! (if (> fee u0)
-          (as-contract (stx-transfer? fee tx-sender recipient))
-          (ok true)))
-        
-        ;; Transfer remaining amount to user
-        (try! (as-contract (stx-transfer? to-user tx-sender tx-sender)))
-        
-        (print {event: "withdraw", user: tx-sender, amount: to-user, shares: user-shares, fee: fee})
-        (ok {amount: to-user, fee: fee})
-      )
+      (token-principal (contract-of token))
+      (asset-config (unwrap! (map-get? asset-configs {token: token-principal}) ERR_ASSET_NOT_FOUND))
+      (shares-to-mint (calculate-shares amount))
     )
-  )
-)
+      (asserts! (get enabled asset-config) ERR_ASSET_DISABLED)
+      ;; Slippage protection
+      (asserts! (>= shares-to-mint min-shares) ERR_SLIPPAGE_EXCEEDED)
+      
+      (deposit-token-internal token amount))))
 
-;; --- Emergency Withdraw (no fee, only in emergency mode) ---
-(define-public (emergency-withdraw)
+;; Core Withdrawal Functions
+(define-private (withdraw-internal (user principal) (shares uint))
+  (let (
+    (assets-to-redeem (calculate-assets shares))
+    (withdraw-fee (get-user-withdraw-fee user assets-to-redeem))
+    (net-amount (if (>= assets-to-redeem withdraw-fee) (- assets-to-redeem withdraw-fee) u0))
+    (user-data (unwrap-panic (map-get? user-shares {user: user})))
+    (current-shares (get shares user-data))
+    (current-volume (get total-volume user-data))
+  )
+    ;; Transfer fee to fee recipient (if any)
+    (if (> withdraw-fee u0)
+      (unwrap-panic (as-contract (stx-transfer? withdraw-fee tx-sender (var-get fee-recipient))))
+      true)
+    
+    ;; Transfer net amount to user
+    (unwrap-panic (as-contract (stx-transfer? net-amount tx-sender user)))
+    
+    ;; Update user shares
+    (map-set user-shares 
+      {user: user}
+      {
+        shares: (- current-shares shares),
+        total-volume: current-volume,
+        last-deposit: (get last-deposit user-data)
+      })
+    
+    ;; Update vault totals
+    (var-set total-shares (- (var-get total-shares) shares))
+    (var-set total-assets (- (var-get total-assets) assets-to-redeem))
+    
+    ;; Return the net amount (not wrapped in ok)
+    net-amount))
+
+(define-public (withdraw (shares uint))
   (begin
-    (asserts! (var-get emergency-mode) ERR-NOT-EMERGENCY)
+    (asserts! (not (var-get paused)) ERR_PAUSED)
+    (asserts! (is-some (map-get? whitelist {user: tx-sender})) ERR_NOT_WHITELISTED)
+    ;; Validate input
+    (asserts! (validate-shares-amount shares) ERR_INVALID_AMOUNT)
+    (asserts! (check-vault-invariants) ERR_VAULT_INVARIANT) ;; Add invariant check
+    
     (let (
-          (user-balance (default-to u0 (map-get? shares {user: tx-sender})))
-          (vault-assets (var-get total-assets))
-          (vault-shares (var-get total-shares))
-      )
-      (asserts! (> user-balance u0) ERR-NO-SHARES)
-      (let (
-            (redeem-amount (/ (* user-balance vault-assets) vault-shares))
-          )
-        (map-set shares {user: tx-sender} u0)
-        (var-set total-shares (- vault-shares user-balance))
-        (var-set total-assets (- vault-assets redeem-amount))
-        (try! (as-contract (stx-transfer? redeem-amount tx-sender tx-sender)))
-        (print {event: "emergency-withdraw", user: tx-sender, amount: redeem-amount, shares: user-balance, fee: u0})
-        (ok {amount: redeem-amount, fee: u0})
-      )
+      (user-data (default-to DEFAULT_USER_DATA (map-get? user-shares {user: tx-sender})))
+      (user-shares-balance (get shares user-data))
     )
-  )
-)
+      (asserts! (>= user-shares-balance shares) ERR_INSUFFICIENT_SHARES)
+      ;; Call internal function and wrap result in ok
+      (ok (withdraw-internal tx-sender shares)))))
 
-;; --- Strategy Interface (extendable) ---
+;; NEW: Enhanced withdraw with slippage protection
+(define-public (withdraw-with-slippage (shares uint) (min-assets uint))
+  (begin
+    (asserts! (not (var-get paused)) ERR_PAUSED)
+    (asserts! (is-some (map-get? whitelist {user: tx-sender})) ERR_NOT_WHITELISTED)
+    (asserts! (validate-shares-amount shares) ERR_INVALID_AMOUNT)
+    (asserts! (> min-assets u0) ERR_INVALID_AMOUNT)
+    (asserts! (check-vault-invariants) ERR_VAULT_INVARIANT)
+    
+    (let (
+      (user-data (default-to DEFAULT_USER_DATA (map-get? user-shares {user: tx-sender})))
+      (user-shares-balance (get shares user-data))
+      (assets-to-redeem (calculate-assets shares))
+      (withdraw-fee (get-user-withdraw-fee tx-sender assets-to-redeem))
+      (net-amount (if (>= assets-to-redeem withdraw-fee) (- assets-to-redeem withdraw-fee) u0))
+    )
+      (asserts! (>= user-shares-balance shares) ERR_INSUFFICIENT_SHARES)
+      ;; Slippage protection
+      (asserts! (>= net-amount min-assets) ERR_SLIPPAGE_EXCEEDED)
+      
+      (ok (withdraw-internal tx-sender shares)))))
+
+(define-private (withdraw-token-internal (user principal) (shares uint))
+  (let (
+    (assets-to-redeem (calculate-assets shares))
+    (withdraw-fee (get-user-withdraw-fee user assets-to-redeem))
+    (net-amount (if (>= assets-to-redeem withdraw-fee) (- assets-to-redeem withdraw-fee) u0))
+    (user-data (unwrap-panic (map-get? user-shares {user: user})))
+    (current-shares (get shares user-data))
+    (current-volume (get total-volume user-data))
+  )
+    ;; Update user shares
+    (map-set user-shares 
+      {user: user}
+      {
+        shares: (- current-shares shares),
+        total-volume: current-volume,
+        last-deposit: (get last-deposit user-data)
+      })
+    
+    ;; Update vault totals
+    (var-set total-shares (- (var-get total-shares) shares))
+    (var-set total-assets (- (var-get total-assets) assets-to-redeem))
+    
+    ;; Return the net amount (not wrapped in ok)
+    net-amount))
+
+(define-public (withdraw-token (shares uint))
+  (begin
+    (asserts! (not (var-get paused)) ERR_PAUSED)
+    (asserts! (is-some (map-get? whitelist {user: tx-sender})) ERR_NOT_WHITELISTED)
+    ;; Validate input
+    (asserts! (validate-shares-amount shares) ERR_INVALID_AMOUNT)
+    (asserts! (check-vault-invariants) ERR_VAULT_INVARIANT) ;; Add invariant check
+    
+    (let (
+      (user-data (default-to DEFAULT_USER_DATA (map-get? user-shares {user: tx-sender})))
+      (user-shares-balance (get shares user-data))
+    )
+      (asserts! (>= user-shares-balance shares) ERR_INSUFFICIENT_SHARES)
+      ;; Call internal function and wrap result in ok
+      (ok (withdraw-token-internal tx-sender shares)))))
+
+;; Emergency Functions
+(define-private (emergency-withdraw-internal (user principal) (recipient principal))
+  (let (
+    (user-data (unwrap-panic (map-get? user-shares {user: user})))
+    (user-shares-balance (get shares user-data))
+    (assets-to-redeem (calculate-assets user-shares-balance))
+  )
+    ;; Transfer all assets to recipient (no fees in emergency)
+    (unwrap-panic (as-contract (stx-transfer? assets-to-redeem tx-sender recipient)))
+    
+    ;; Clear user shares
+    (map-set user-shares 
+      {user: user}
+      {
+        shares: u0,
+        total-volume: (get total-volume user-data),
+        last-deposit: (get last-deposit user-data)
+      })
+    
+    ;; Update vault totals
+    (var-set total-shares (- (var-get total-shares) user-shares-balance))
+    (var-set total-assets (- (var-get total-assets) assets-to-redeem))
+    
+    ;; Return the assets redeemed
+    assets-to-redeem))
+
+(define-public (emergency-withdraw (recipient principal))
+  (begin
+    (asserts! (var-get emergency-mode) ERR_NOT_EMERGENCY)
+    ;; Validate input
+    (asserts! (is-valid-principal recipient) ERR_INVALID_RECIPIENT)
+    
+    (let (
+      (user-data (default-to DEFAULT_USER_DATA (map-get? user-shares {user: tx-sender})))
+      (user-shares-balance (get shares user-data))
+    )
+      (asserts! (> user-shares-balance u0) ERR_INSUFFICIENT_SHARES)
+      (ok (emergency-withdraw-internal tx-sender recipient)))))
+
+;; Transfer Functions
+(define-private (transfer-internal (from principal) (to principal) (shares uint))
+  (let (
+    (from-data (unwrap-panic (map-get? user-shares {user: from})))
+    (to-data (default-to DEFAULT_USER_DATA (map-get? user-shares {user: to})))
+    (from-shares (get shares from-data))
+    (to-shares (get shares to-data))
+  )
+    ;; Update sender
+    (map-set user-shares 
+      {user: from}
+      {
+        shares: (- from-shares shares),
+        total-volume: (get total-volume from-data),
+        last-deposit: (get last-deposit from-data)
+      })
+    
+    ;; Update recipient
+    (map-set user-shares 
+      {user: to}
+      {
+        shares: (+ to-shares shares),
+        total-volume: (get total-volume to-data),
+        last-deposit: (get last-deposit to-data)
+      })
+    
+    ;; Return success
+    true))
+
+(define-public (transfer (to principal) (shares uint))
+  (begin
+    (asserts! (not (var-get paused)) ERR_PAUSED)
+    ;; Validate inputs
+    (asserts! (is-valid-principal to) ERR_INVALID_RECIPIENT)
+    (asserts! (validate-shares-amount shares) ERR_INVALID_AMOUNT)
+    (asserts! (not (is-eq tx-sender to)) ERR_SELF_TRANSFER)
+    
+    (let (
+      (sender-data (default-to DEFAULT_USER_DATA (map-get? user-shares {user: tx-sender})))
+      (sender-shares (get shares sender-data))
+    )
+      (asserts! (>= sender-shares shares) ERR_INSUFFICIENT_SHARES)
+      (ok (transfer-internal tx-sender to shares)))))
+
+;; Strategy Functions
 (define-public (stake-into-strategy)
   (begin
-    (try! (only-admin))
-    (let ((assets (var-get total-assets)))
-      (var-set staked-amount assets)
-      (var-set total-assets u0)
-      (ok true)
-    )
-  )
-)
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    (let ((available-balance (stx-get-balance (as-contract tx-sender))))
+      (var-set staked-amount available-balance)
+      (ok available-balance))))
 
 (define-public (harvest-yield)
   (begin
-    (try! (only-admin))
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    ;; Simulate yield generation (10% of staked amount)
     (let (
-          (staked (var-get staked-amount))
-          (yield (var-get fake-yield))
-          (new-total (+ staked yield))
-      )
-      (var-set total-assets new-total)
-      (var-set staked-amount u0)
-      (var-set fake-yield u0)
-      (print {event: "yield-harvested", amount: yield})
-      (ok yield)
+      (current-staked (var-get staked-amount))
+      (yield-amount (/ current-staked u10))
     )
-  )
-)
+      (var-set total-assets (+ (var-get total-assets) yield-amount))
+      (ok yield-amount))))
 
-(define-public (simulate-yield (amount uint))
+;; Admin Functions
+(define-public (set-admin (new-admin principal))
   (begin
-    (try! (only-admin))
-    (var-set fake-yield amount)
-    (ok true)
-  )
-)
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    (asserts! (is-valid-principal new-admin) ERR_INVALID_RECIPIENT)
+    (var-set admin new-admin)
+    (ok true)))
 
-;; --- Rebalance (strategy switching) ---
-(define-public (rebalance (to-strategy uint))
+(define-public (pause)
   (begin
-    (try! (only-admin))
-    (var-set strategy to-strategy)
-    (ok true)
-  )
-)
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    (var-set paused true)
+    (ok true)))
 
-;; --- Read-Only Helpers ---
+(define-public (unpause)
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    (var-set paused false)
+    (ok true)))
+
+(define-public (set-emergency-mode (enabled bool))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    (var-set emergency-mode enabled)
+    (ok true)))
+
+(define-public (set-base-withdraw-fee (fee-bps uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    (asserts! (is-valid-fee-bps fee-bps) ERR_INVALID_AMOUNT)
+    (asserts! (<= fee-bps u1000) ERR_INVALID_AMOUNT) ;; Max 10%
+    
+    (var-set base-withdraw-fee-bps fee-bps)
+    (ok true)))
+
+(define-public (set-performance-fee (fee-bps uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    (asserts! (is-valid-fee-bps fee-bps) ERR_INVALID_AMOUNT)
+    (asserts! (<= fee-bps u2000) ERR_INVALID_AMOUNT) ;; Max 20%
+    
+    (var-set performance-fee-bps fee-bps)
+    (ok true)))
+
+(define-public (set-fee-recipient (recipient principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    ;; Validate input
+    (asserts! (is-valid-principal recipient) ERR_INVALID_RECIPIENT)
+    
+    (var-set fee-recipient recipient)
+    (ok true)))
+
+;; Whitelist Management
+(define-public (add-to-whitelist (user principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    ;; Validate input
+    (asserts! (is-valid-principal user) ERR_INVALID_RECIPIENT)
+    
+    (map-set whitelist {user: user} {whitelisted: true})
+    (ok true)))
+
+(define-public (remove-from-whitelist (user principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    (asserts! (is-valid-principal user) ERR_INVALID_RECIPIENT)
+    
+    (map-delete whitelist {user: user})
+    (ok true)))
+
+;; Read-Only Functions
 (define-read-only (get-user-shares (user principal))
-  (default-to u0 (map-get? shares {user: user}))
-)
+  (default-to DEFAULT_USER_DATA (map-get? user-shares {user: user})))
 
-(define-read-only (get-user-tier-info (user principal))
-  (let (
-    (tier-data (default-to {tier: u0, total-volume: u0, last-deposit-height: u0} 
-                           (map-get? user-tiers {user: user})))
-    (current-tier (calculate-user-tier user))
-  )
-    (merge tier-data {calculated-tier: current-tier})
-  )
-)
+(define-read-only (get-user-tier (user principal))
+  (calculate-user-tier user))
+
+(define-read-only (get-vault-info)
+  {
+    total-shares: (var-get total-shares),
+    total-assets: (var-get total-assets),
+    share-price: (if (> (var-get total-shares) u0) 
+                   (/ (* (var-get total-assets) u1000000) (var-get total-shares))
+                   u1000000),
+    paused: (var-get paused),
+    emergency-mode: (var-get emergency-mode)
+  })
 
 (define-read-only (get-asset-config (token principal))
-  (map-get? asset-configs {token: token})
-)
+  (map-get? asset-configs {token: token}))
 
 (define-read-only (get-asset-balance (token principal))
-  (default-to u0 (map-get? asset-balances {token: token}))
-)
-
-(define-read-only (get-total-assets) (var-get total-assets))
-(define-read-only (get-total-shares) (var-get total-shares))
-(define-read-only (get-strategy) (var-get strategy))
-
-(define-read-only (get-share-price)
-  (let ((assets (var-get total-assets))
-        (total-shares-val (var-get total-shares)))
-    (if (is-eq total-shares-val u0)
-        u0
-        (/ assets total-shares-val)
-    )
-  )
-)
-
-(define-read-only (get-fee-info)
-  {
-    base-withdraw-fee-bps: (var-get base-withdraw-fee-bps),
-    performance-fee-bps: (var-get performance-fee-bps),
-    fee-recipient: (var-get fee-recipient)
-  }
-)
-
-(define-read-only (get-user-withdraw-fee-preview (user principal) (amount uint))
-  (get-user-withdraw-fee user amount)
-)
-
-(define-read-only (is-paused) (var-get paused))
-(define-read-only (is-emergency) (var-get emergency-mode))
-(define-read-only (get-admin) (var-get admin))
+  (map-get? asset-balances {token: token}))
 
 (define-read-only (is-whitelisted (user principal))
-  (default-to false (map-get? whitelist {user: user}))
-)
+  (is-some (map-get? whitelist {user: user})))
 
-;; Legacy compatibility
-(define-public (set-withdraw-fee (fee-bps uint))
-  (set-base-withdraw-fee fee-bps)
-)
+(define-read-only (get-withdraw-fee-preview (user principal) (shares uint))
+  (let ((assets (calculate-assets shares)))
+    (get-user-withdraw-fee user assets)))
+
+;; NEW: Vault health check function
+(define-read-only (get-vault-health)
+  {
+    invariants-valid: (check-vault-invariants),
+    total-shares: (var-get total-shares),
+    total-assets: (var-get total-assets),
+    share-asset-ratio: (if (> (var-get total-shares) u0)
+                        (/ (* (var-get total-assets) u1000000) (var-get total-shares))
+                        u0)
+  })
+
+;; Legacy compatibility functions
+(define-public (get-balance (user principal))
+  (ok (get shares (get-user-shares user))))
+
+(define-public (get-total-supply)
+  (ok (var-get total-shares)))
+
+;; Initialize user tiers
+(map-set user-tiers u0 {min-volume: u0, withdraw-discount: u0, performance-discount: u0})
+(map-set user-tiers u1 {min-volume: u100000000, withdraw-discount: u10, performance-discount: u25}) ;; 100 STX
+(map-set user-tiers u2 {min-volume: u500000000, withdraw-discount: u25, performance-discount: u50}) ;; 500 STX
+(map-set user-tiers u3 {min-volume: u1000000000, withdraw-discount: u50, performance-discount: u100}) ;; 1000 STX
+
+;; Initialize admin whitelist
+(map-set whitelist {user: tx-sender} {whitelisted: true})
