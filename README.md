@@ -16,7 +16,7 @@ This Clarity smart contract implements a multi-asset vault for STX and SIP-010 t
   Withdraw and performance fees are set in basis points and can be discounted by user tier.
 
 - **Admin Controls:**  
-  Admin can pause/unpause the contract, set fees, manage whitelist, enable emergency mode, and upgrade the contract.
+  Admin can pause/unpause the contract, set fees, manage whitelist, enable emergency mode, and change admin or fee recipient.
 
 - **Whitelist:**  
   Only whitelisted users can deposit and withdraw.
@@ -27,17 +27,23 @@ This Clarity smart contract implements a multi-asset vault for STX and SIP-010 t
 - **Strategy Interface:**  
   Simulate staking assets and harvesting yield for extensibility.
 
+- **Slippage Protection:**  
+  Deposit and withdrawal functions support minimum share/asset requirements to protect users from slippage.
+
+- **Vault Health Checks:**  
+  Read-only functions allow monitoring of vault invariants and share/asset ratios.
+
 ---
 
 ## Usage
 
 ### Admin Functions
 
-- `add-supported-asset(token, max-allocation, decimals)`  
+- `add-asset(token, decimals)`  
   Add a SIP-010 token as a supported asset.
 
-- `toggle-asset(token, enabled)`  
-  Enable or disable a supported asset.
+- `remove-asset(token)`  
+  Remove a supported asset.
 
 - `set-admin(new-admin)`  
   Change the admin address.
@@ -54,17 +60,11 @@ This Clarity smart contract implements a multi-asset vault for STX and SIP-010 t
 - `set-fee-recipient(recipient)`  
   Set the recipient for collected fees.
 
-- `update-tier-discount(tier, withdraw-discount, performance-discount, volume-threshold)`  
-  Update tier-based fee discounts and thresholds.
-
-- `update-whitelist(user, status)`  
+- `add-to-whitelist(user)` / `remove-from-whitelist(user)`  
   Add or remove a user from the whitelist.
 
-- `enable-emergency()` / `disable-emergency()`  
+- `set-emergency-mode(enabled)`  
   Enable or disable emergency mode.
-
-- `upgrade(new-contract)`  
-  Signal contract upgrade.
 
 ---
 
@@ -73,14 +73,29 @@ This Clarity smart contract implements a multi-asset vault for STX and SIP-010 t
 - `deposit(amount)`  
   Deposit STX to the vault.
 
+- `deposit-with-slippage(amount, min-shares)`  
+  Deposit STX with minimum shares requirement.
+
 - `deposit-token(token, amount)`  
   Deposit SIP-010 tokens to the vault.
 
-- `withdraw(user-shares)`  
+- `deposit-token-with-slippage(token, amount, min-shares)`  
+  Deposit SIP-010 tokens with minimum shares requirement.
+
+- `withdraw(shares)`  
   Withdraw assets based on shares, with dynamic fees.
 
-- `emergency-withdraw()`  
+- `withdraw-with-slippage(shares, min-assets)`  
+  Withdraw with minimum asset requirement.
+
+- `withdraw-token(shares)`  
+  Withdraw SIP-010 tokens based on shares.
+
+- `emergency-withdraw(recipient)`  
   Withdraw all assets without fees (only in emergency mode).
+
+- `transfer(to, shares)`  
+  Transfer vault shares to another user.
 
 ---
 
@@ -92,21 +107,18 @@ This Clarity smart contract implements a multi-asset vault for STX and SIP-010 t
 - `harvest-yield()`  
   Harvest simulated yield (admin only).
 
-- `simulate-yield(amount)`  
-  Set simulated yield amount (admin only).
-
-- `rebalance(to-strategy)`  
-  Switch strategy (admin only).
-
 ---
 
 ### Read-Only Functions
 
 - `get-user-shares(user)`  
-  Get user's share balance.
+  Get user's share balance and deposit info.
 
-- `get-user-tier-info(user)`  
-  Get user's tier and deposit volume.
+- `get-user-tier(user)`  
+  Get user's tier.
+
+- `get-vault-info()`  
+  Get vault stats, share price, and status.
 
 - `get-asset-config(token)`  
   Get asset configuration.
@@ -114,48 +126,41 @@ This Clarity smart contract implements a multi-asset vault for STX and SIP-010 t
 - `get-asset-balance(token)`  
   Get vault balance for an asset.
 
-- `get-total-assets()`  
-  Get total assets in the vault.
-
-- `get-total-shares()`  
-  Get total shares issued.
-
-- `get-share-price()`  
-  Get current share price.
-
-- `get-fee-info()`  
-  Get current fee settings.
-
-- `get-user-withdraw-fee-preview(user, amount)`  
-  Preview withdraw fee for a user.
-
-- `is-paused()`  
-  Check if contract is paused.
-
-- `is-emergency()`  
-  Check if emergency mode is enabled.
-
-- `get-admin()`  
-  Get current admin address.
-
 - `is-whitelisted(user)`  
   Check if a user is whitelisted.
+
+- `get-withdraw-fee-preview(user, shares)`  
+  Preview withdraw fee for a user and share amount.
+
+- `get-vault-health()`  
+  Check vault invariants and ratios.
+
+- `get-balance(user)`  
+  Get user's share balance (legacy).
+
+- `get-total-supply()`  
+  Get total shares issued (legacy).
 
 ---
 
 ## Error Codes
 
-- `ERR-NO-FUNDS` (u100): No funds provided.
-- `ERR-NO-SHARES` (u101): Insufficient shares.
-- `ERR-PAUSED` (u102): Contract is paused.
-- `ERR-NOT-ADMIN` (u103): Caller is not admin.
-- `ERR-INVALID-FEE` (u104): Invalid fee value.
-- `ERR-NOT-WHITELISTED` (u105): User not whitelisted.
-- `ERR-NOT-EMERGENCY` (u106): Emergency mode not enabled.
-- `ERR-ASSET-NOT-SUPPORTED` (u107): Asset not supported.
-- `ERR-ASSET-DISABLED` (u108): Asset is disabled.
-- `ERR-MAX-ALLOCATION-EXCEEDED` (u109): Max allocation exceeded.
-- `ERR-INVALID-TOKEN` (u110): Invalid token.
+- `ERR_UNAUTHORIZED` (u100): Caller is not admin.
+- `ERR_PAUSED` (u101): Contract is paused.
+- `ERR_NOT_WHITELISTED` (u102): User not whitelisted.
+- `ERR_INSUFFICIENT_BALANCE` (u103): Insufficient balance.
+- `ERR_INSUFFICIENT_SHARES` (u104): Insufficient shares.
+- `ERR_INVALID_AMOUNT` (u105): Invalid amount.
+- `ERR_TRANSFER_FAILED` (u106): Transfer failed.
+- `ERR_ASSET_NOT_FOUND` (u107): Asset not found.
+- `ERR_NOT_EMERGENCY` (u108): Emergency mode not enabled.
+- `ERR_INVALID_TOKEN` (u1001): Invalid token.
+- `ERR_INVALID_RECIPIENT` (u1002): Invalid recipient.
+- `ERR_SELF_TRANSFER` (u1003): Cannot transfer to self.
+- `ERR_ASSET_EXISTS` (u1004): Asset already exists.
+- `ERR_ASSET_DISABLED` (u1005): Asset is disabled.
+- `ERR_SLIPPAGE_EXCEEDED` (u1006): Slippage protection triggered.
+- `ERR_VAULT_INVARIANT` (u1007): Vault invariant check failed.
 
 ---
 
@@ -165,6 +170,8 @@ This Clarity smart contract implements a multi-asset vault for STX and SIP-010 t
 - Emergency withdrawals are only possible when emergency mode is enabled.
 - Tier upgrades are automatic based on deposit volume.
 - Asset allocations and decimals must be set correctly for SIP-010 tokens.
+- Slippage protection is available for deposits and withdrawals.
+- Vault health and invariants can be monitored via read-only functions.
 
 ---
 
